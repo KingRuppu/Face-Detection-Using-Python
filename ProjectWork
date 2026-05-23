@@ -18,6 +18,11 @@ MODEL_FILE = DATA_DIR / "aniruddha_lbph.yml"
 LEGACY_MODEL_FILE = DATA_DIR / "aniruddha_model.npz"
 FACE_SIZE = (120, 120)
 GRID_SIZE = (8, 8)
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+DETECTION_WIDTH = 320
+DETECTION_INTERVAL = 4
+RECOGNITION_INTERVAL = 4
 
 
 face_cascade = cv2.CascadeClassifier(
@@ -38,20 +43,25 @@ def open_camera(camera_index):
         cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
         raise RuntimeError("Cannot access camera")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 
-def detect_faces(gray):
-    enhanced_images = [cv2.equalizeHist(gray), clahe.apply(gray)]
+def detect_faces(gray, thorough=True):
+    enhanced_images = [cv2.equalizeHist(gray)]
+    if thorough:
+        enhanced_images.append(clahe.apply(gray))
+
     detected = []
 
     detector_settings = [
         (face_cascade, 1.08, 4, (45, 45)),
         (alt_face_cascade, 1.05, 3, (35, 35)),
-        (profile_face_cascade, 1.05, 3, (35, 35)),
     ]
+    if thorough:
+        detector_settings.append((profile_face_cascade, 1.05, 3, (35, 35)))
 
     for enhanced in enhanced_images:
         for cascade, scale_factor, min_neighbors, min_size in detector_settings:
@@ -68,6 +78,21 @@ def detect_faces(gray):
 
     rects = np.array(detected, dtype=np.int32)
     return merge_overlapping_faces(rects)
+
+
+def detect_faces_scaled(gray, thorough=False):
+    height, width = gray.shape[:2]
+    if width <= DETECTION_WIDTH:
+        return detect_faces(gray, thorough=thorough)
+
+    scale = DETECTION_WIDTH / width
+    small_gray = cv2.resize(gray, (DETECTION_WIDTH, int(height * scale)))
+    small_faces = detect_faces(small_gray, thorough=thorough)
+    if len(small_faces) == 0:
+        return small_faces
+
+    faces = small_faces.astype(np.float32) / scale
+    return faces.astype(np.int32)
 
 
 def merge_overlapping_faces(faces):
@@ -305,6 +330,9 @@ def enroll(camera_index, samples):
 def recognize(camera_index, threshold):
     model = load_model()
     cap = open_camera(camera_index)
+    frame_count = 0
+    last_faces = np.empty((0, 4), dtype=np.int32)
+    last_results = []
 
     print("Recognition started. Press ESC to exit.")
 
@@ -316,23 +344,32 @@ def recognize(camera_index, threshold):
 
         frame = cv2.flip(frame, 1)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = detect_faces(gray)
+        should_detect = frame_count % DETECTION_INTERVAL == 0
+        should_recognize = frame_count % RECOGNITION_INTERVAL == 0
 
-        for face in faces:
+        if should_detect:
+            last_faces = detect_faces_scaled(gray, thorough=False)
+
+        if should_detect or should_recognize:
+            last_results = []
+            for face in last_faces:
+                x, y, w, h = face
+                face_img = crop_face(gray, face)
+                name, confidence, distance = recognize_face(
+                    face_img, model, threshold
+                )
+
+                known = name != "Unknown"
+                color = (0, 200, 0) if known else (0, 0, 255)
+                label = (
+                    f"{name} ({confidence:.0f}%)"
+                    if known
+                    else f"Unknown ({distance:.1f})"
+                )
+                last_results.append((face, label, color))
+
+        for face, label, color in last_results:
             x, y, w, h = face
-            face_img = crop_face(gray, face)
-            name, confidence, distance = recognize_face(
-                face_img, model, threshold
-            )
-
-            known = name != "Unknown"
-            color = (0, 200, 0) if known else (0, 0, 255)
-            label = (
-                f"{name} ({confidence:.0f}%)"
-                if known
-                else f"Unknown ({distance:.1f})"
-            )
-
             cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
             cv2.putText(
                 frame,
@@ -344,7 +381,7 @@ def recognize(camera_index, threshold):
                 2,
             )
 
-        if len(faces) == 0:
+        if len(last_faces) == 0:
             cv2.putText(
                 frame,
                 "No face detected - move closer / improve light",
@@ -356,6 +393,7 @@ def recognize(camera_index, threshold):
             )
 
         cv2.imshow("Face Recognition", frame)
+        frame_count += 1
 
         if cv2.waitKey(1) & 0xFF == 27:
             break
