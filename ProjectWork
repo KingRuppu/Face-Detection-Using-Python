@@ -1,0 +1,411 @@
+import argparse
+from pathlib import Path
+import sys
+
+BASE_DIR = Path(__file__).resolve().parent
+VENDOR_DIR = BASE_DIR / "vendor"
+if VENDOR_DIR.exists():
+    sys.path.insert(0, str(VENDOR_DIR))
+
+import cv2
+import numpy as np
+
+
+PERSON_NAME = "Aniruddha Dutta"
+PERSON_ID = 1
+DATA_DIR = BASE_DIR / "face_data"
+MODEL_FILE = DATA_DIR / "aniruddha_lbph.yml"
+LEGACY_MODEL_FILE = DATA_DIR / "aniruddha_model.npz"
+FACE_SIZE = (120, 120)
+GRID_SIZE = (8, 8)
+
+
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+alt_face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
+)
+profile_face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_profileface.xml"
+)
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+def open_camera(camera_index):
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        raise RuntimeError("Cannot access camera")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    return cap
+
+
+def detect_faces(gray):
+    enhanced_images = [cv2.equalizeHist(gray), clahe.apply(gray)]
+    detected = []
+
+    detector_settings = [
+        (face_cascade, 1.08, 4, (45, 45)),
+        (alt_face_cascade, 1.05, 3, (35, 35)),
+        (profile_face_cascade, 1.05, 3, (35, 35)),
+    ]
+
+    for enhanced in enhanced_images:
+        for cascade, scale_factor, min_neighbors, min_size in detector_settings:
+            faces = cascade.detectMultiScale(
+                enhanced,
+                scaleFactor=scale_factor,
+                minNeighbors=min_neighbors,
+                minSize=min_size,
+            )
+            detected.extend(tuple(face) for face in faces)
+
+    if not detected:
+        return np.empty((0, 4), dtype=np.int32)
+
+    rects = np.array(detected, dtype=np.int32)
+    return merge_overlapping_faces(rects)
+
+
+def merge_overlapping_faces(faces):
+    merged = []
+
+    for face in sorted(faces, key=lambda item: item[2] * item[3], reverse=True):
+        if all(face_overlap(face, existing) < 0.35 for existing in merged):
+            merged.append(face)
+
+    return np.array(merged, dtype=np.int32)
+
+
+def face_overlap(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1 = max(ax, bx)
+    y1 = max(ay, by)
+    x2 = min(ax + aw, bx + bw)
+    y2 = min(ay + ah, by + bh)
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    smaller_area = min(aw * ah, bw * bh)
+    return intersection / (smaller_area + 1e-7)
+
+
+def largest_face(faces):
+    if len(faces) == 0:
+        return None
+    return max(faces, key=lambda face: face[2] * face[3])
+
+
+def crop_face(gray, face):
+    x, y, w, h = face
+    face_img = gray[y : y + h, x : x + w]
+    face_img = cv2.resize(face_img, FACE_SIZE)
+    return cv2.equalizeHist(face_img)
+
+
+def lbp_histogram(face_img):
+    center = face_img[1:-1, 1:-1]
+    codes = np.zeros(center.shape, dtype=np.uint8)
+
+    neighbors = [
+        face_img[:-2, :-2],
+        face_img[:-2, 1:-1],
+        face_img[:-2, 2:],
+        face_img[1:-1, 2:],
+        face_img[2:, 2:],
+        face_img[2:, 1:-1],
+        face_img[2:, :-2],
+        face_img[1:-1, :-2],
+    ]
+
+    for bit, neighbor in enumerate(neighbors):
+        codes |= ((neighbor >= center).astype(np.uint8) << bit)
+
+    rows, cols = GRID_SIZE
+    cell_h = codes.shape[0] // rows
+    cell_w = codes.shape[1] // cols
+    hist_parts = []
+
+    for row in range(rows):
+        for col in range(cols):
+            cell = codes[
+                row * cell_h : (row + 1) * cell_h,
+                col * cell_w : (col + 1) * cell_w,
+            ]
+            hist, _ = np.histogram(cell, bins=256, range=(0, 256))
+            hist = hist.astype(np.float32)
+            hist /= hist.sum() + 1e-7
+            hist_parts.append(hist)
+
+    return np.concatenate(hist_parts)
+
+
+def train_model():
+    image_dir = DATA_DIR / "aniruddha_dutta"
+    image_paths = sorted(image_dir.glob("*.png"))
+
+    if not image_paths:
+        raise RuntimeError("No enrolled face images found. Run enroll mode first.")
+
+    face_images = []
+    labels = []
+
+    for image_path in image_paths:
+        face_img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        if face_img is None:
+            continue
+        face_images.append(face_img)
+        labels.append(PERSON_ID)
+
+    if not face_images:
+        raise RuntimeError("Could not read any enrolled face images.")
+
+    DATA_DIR.mkdir(exist_ok=True)
+
+    if hasattr(cv2, "face") and hasattr(cv2.face, "LBPHFaceRecognizer_create"):
+        recognizer = cv2.face.LBPHFaceRecognizer_create(
+            radius=1,
+            neighbors=8,
+            grid_x=8,
+            grid_y=8,
+        )
+        recognizer.train(face_images, np.array(labels, dtype=np.int32))
+        recognizer.save(str(MODEL_FILE))
+        print(f"Trained LBPH model with {len(face_images)} face samples.")
+        return
+
+    np.savez(
+        LEGACY_MODEL_FILE,
+        histograms=np.array([lbp_histogram(img) for img in face_images], dtype=np.float32),
+        labels=np.array(labels, dtype=np.int32),
+        names=np.array([PERSON_NAME]),
+    )
+    print(f"Trained fallback model with {len(face_images)} face samples.")
+
+
+def load_model():
+    if MODEL_FILE.exists() and hasattr(cv2, "face"):
+        recognizer = cv2.face.LBPHFaceRecognizer_create()
+        recognizer.read(str(MODEL_FILE))
+        return {"type": "lbph", "recognizer": recognizer}
+
+    if LEGACY_MODEL_FILE.exists():
+        model = np.load(LEGACY_MODEL_FILE, allow_pickle=True)
+        return {
+            "type": "fallback",
+            "histograms": model["histograms"],
+            "labels": model["labels"],
+            "names": model["names"],
+        }
+
+    if not MODEL_FILE.exists() and not LEGACY_MODEL_FILE.exists():
+        raise RuntimeError(
+            f"No trained model found at {MODEL_FILE}. Run enroll mode first."
+        )
+
+
+def chi_square_distance(a, b):
+    return 0.5 * np.sum(((a - b) ** 2) / (a + b + 1e-7), axis=1)
+
+
+def recognize_face(face_img, model, threshold):
+    if model["type"] == "lbph":
+        label_id, confidence = model["recognizer"].predict(face_img)
+        if label_id == PERSON_ID and confidence <= threshold:
+            score = max(0, min(100, 100 * (1 - confidence / threshold)))
+            return PERSON_NAME, score, float(confidence)
+        return "Unknown", 0.0, float(confidence)
+
+    manual_threshold = threshold if threshold < 5 else 0.65
+    query = lbp_histogram(face_img)
+    histograms = model["histograms"]
+    labels = model["labels"]
+    names = model["names"]
+    distances = chi_square_distance(histograms, query)
+    best_index = int(np.argmin(distances))
+    best_distance = float(distances[best_index])
+
+    if best_distance <= manual_threshold:
+        label_id = int(labels[best_index])
+        name = str(names[label_id - 1])
+        confidence = max(0, min(100, 100 * (1 - best_distance / manual_threshold)))
+        return name, confidence, best_distance
+
+    return "Unknown", 0.0, best_distance
+
+
+def enroll(camera_index, samples):
+    output_dir = DATA_DIR / "aniruddha_dutta"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cap = open_camera(camera_index)
+    saved = 0
+    frame_count = 0
+
+    print("Enrollment started. Look at the camera and slowly turn your head.")
+    print("Press ESC to stop early.")
+
+    while saved < samples:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
+
+        frame = cv2.flip(frame, 1)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = detect_faces(gray)
+        face = largest_face(faces)
+
+        if face is not None:
+            x, y, w, h = face
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 180, 255), 2)
+
+            if frame_count % 4 == 0:
+                face_img = crop_face(gray, face)
+                cv2.imwrite(str(output_dir / f"sample_{saved + 1:03d}.png"), face_img)
+                saved += 1
+
+        frame_count += 1
+        cv2.putText(
+            frame,
+            f"Enrolling {PERSON_NAME}: {saved}/{samples}",
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 180, 255),
+            2,
+        )
+        if face is None:
+            cv2.putText(
+                frame,
+                "Move closer and face the camera",
+                (20, 70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+            )
+        cv2.imshow("Enroll Face", frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    if saved == 0:
+        raise RuntimeError("No face samples were saved.")
+
+    train_model()
+    print(f"Enrollment complete for {PERSON_NAME}.")
+
+
+def recognize(camera_index, threshold):
+    model = load_model()
+    cap = open_camera(camera_index)
+
+    print("Recognition started. Press ESC to exit.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
+
+        frame = cv2.flip(frame, 1)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = detect_faces(gray)
+
+        for face in faces:
+            x, y, w, h = face
+            face_img = crop_face(gray, face)
+            name, confidence, distance = recognize_face(
+                face_img, model, threshold
+            )
+
+            known = name != "Unknown"
+            color = (0, 200, 0) if known else (0, 0, 255)
+            label = (
+                f"{name} ({confidence:.0f}%)"
+                if known
+                else f"Unknown ({distance:.1f})"
+            )
+
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(
+                frame,
+                label,
+                (x, max(25, y - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                color,
+                2,
+            )
+
+        if len(faces) == 0:
+            cv2.putText(
+                frame,
+                "No face detected - move closer / improve light",
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+            )
+
+        cv2.imshow("Face Recognition", frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Enroll and recognize Aniruddha Dutta from webcam video."
+    )
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=["auto", "enroll", "recognize", "train"],
+        default="auto",
+        help="Use enroll first, then recognize. Auto enrolls if no model exists.",
+    )
+    parser.add_argument("--camera", type=int, default=0, help="Webcam index.")
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=80,
+        help="Number of face samples to capture during enrollment.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=80.0,
+        help="LBPH threshold. Lower is stricter. Try 60-120 if recognition is too strict/loose.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.mode == "auto":
+        if not MODEL_FILE.exists() and not LEGACY_MODEL_FILE.exists():
+            print("No trained model found yet. Starting enrollment first.")
+            enroll(args.camera, args.samples)
+        recognize(args.camera, args.threshold)
+    elif args.mode == "enroll":
+        enroll(args.camera, args.samples)
+    elif args.mode == "train":
+        train_model()
+    else:
+        recognize(args.camera, args.threshold)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+vendor/
+
+# Local training data and biometric models should stay private.
+face_data/
+
+# OpenCV runtime files
+*.avi
+*.mp4
+*.log
