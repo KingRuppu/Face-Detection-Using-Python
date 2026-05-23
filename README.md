@@ -2,6 +2,8 @@
 
 Simple OpenCV webcam face enrollment and recognition for Aniruddha Dutta.
 
+[Open in Google Colab](https://colab.research.google.com/github/KingRuppu/Face-Detection-Using-Python/blob/main/Face_Detection_Colab.ipynb)
+
 ## Setup
 
 ```powershell
